@@ -76,8 +76,9 @@ where
     std::thread::spawn(move || {
         // Run the thread
         let res = f();
-        // Pass the result back
-        tx.send(res).unwrap();
+        // Pass the result back, but don't panic if the receiving future
+        // was already dropped/cancelled (channel disconnected).
+        let _ = tx.send(res);
         // If someone polled the thread before we got here,
         // they will have populated the waker; extract it
         // and wake up the scheduler so that it will poll
@@ -97,15 +98,31 @@ where
         type Output = Result<T>;
 
         fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Self::Output> {
+            // Check if result is already available
             match self.rx.try_recv() {
                 Ok(res) => Poll::Ready(res),
-                Err(TryRecvError::Empty) => {
-                    let mut waker = self.holder.waker.lock().unwrap();
-                    waker.replace(cx.waker().clone());
-                    Poll::Pending
-                }
                 Err(TryRecvError::Disconnected) => {
                     Poll::Ready(Err(anyhow!("thread terminated without providing a result")))
+                }
+                Err(TryRecvError::Empty) => {
+                    // Register waker first, then re-check to close the race window
+                    // where the worker sends after our first check but before
+                    // we store the waker. This is the classic "register then recheck"
+                    // pattern for correct wakeup semantics.
+                    let mut waker = self.holder.waker.lock().unwrap();
+                    waker.replace(cx.waker().clone());
+                    drop(waker);
+
+                    // Re-check after registering waker - if the worker sent
+                    // during the window between our first check and storing the
+                    // waker, we'll find it now and won't miss the wakeup.
+                    match self.rx.try_recv() {
+                        Ok(res) => Poll::Ready(res),
+                        Err(TryRecvError::Disconnected) => Poll::Ready(Err(anyhow!(
+                            "thread terminated without providing a result"
+                        ))),
+                        Err(TryRecvError::Empty) => Poll::Pending,
+                    }
                 }
             }
         }
