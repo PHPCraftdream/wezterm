@@ -22,6 +22,12 @@ usually the best available version.
 As features stabilize some brief notes about them will accumulate here.
 
 #### Changed
+* WSL domains are now more strictly identified: a `wsl_domains` entry whose
+  `name` happens to match a domain that was NOT itself created as a WSL domain
+  (for example, the built-in `local` domain) no longer causes that domain to be
+  treated as a WSL domain. Only domains actually registered via WSL discovery
+  or an explicit `wsl_domains` entry that creates a new domain get WSL treatment
+  now. #7782
 * DECRQCRA is now disabled by default to prevent silent screen scraping.
   Set `enable_checksum_rectangular_area = true` to re-enable it.
   Thanks to @jquast! #7701
@@ -152,6 +158,29 @@ As features stabilize some brief notes about them will accumulate here.
   search matching. Thanks to @mrdziuban! #7385
 
 #### Fixed
+* Windows: startup (and, separately, the first pane spawn) could take 15-50+
+  seconds when `wsl_domains` wasn't explicitly configured, because discovering
+  the default list of WSL domains shelled out to `wsl.exe -l -v` synchronously
+  on the startup path, and again on every pane spawn regardless of what kind
+  of domain was being spawned into. WSL domain discovery now runs on a
+  background thread instead of blocking startup, and its result is cached for
+  the life of the process instead of being recomputed on every spawn. One
+  consequence: a long-lived process (in particular `wezterm-mux-server`)
+  won't notice a WSL distro installed or removed after it started, even
+  across a config reload, until it's restarted; a config that calls
+  `wezterm.default_wsl_domains()` directly to build its `wsl_domains` list
+  (see that function's docs) picks up newly installed distributions, since
+  that always runs a fresh, live `wsl -l -v` rather than consulting this
+  cache; it does not make removed ones go away, because domains already
+  registered with the multiplexer are never unregistered. A
+  `default_domain`/`default_mux_server_domain`/`--domain` naming a WSL domain
+  that hasn't been discovered yet is still waited for rather than failing
+  outright. Because discovery is now asynchronous, `wezterm.mux.get_domain()`
+  and `wezterm.mux.all_domains()` may not yet see an auto-discovered WSL domain
+  if called from a `gui-startup` or `mux-startup` event handler that fires
+  before discovery finishes; a config author who needs a specific WSL domain
+  deterministically available at startup should set `wsl_domains` explicitly
+  instead of relying on auto-discovery. #7782
 * `ResetTerminal` (RIS) did not reset the `modifyOtherKeys` state. A program
   that left it enabled and exited uncleanly could leave ctrl keys emitting
   escape sequences that the shell doesn't expect. RIS now also resets the
