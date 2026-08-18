@@ -22,6 +22,72 @@ lazy_static::lazy_static! {
 
 static SCHEDULER_CONFIGURED: AtomicBool = AtomicBool::new(false);
 
+/// Test-only scaffolding for the reproductions in `mod tests` below.
+///
+/// The lost-wakeup defect lives in a window a handful of instructions wide,
+/// so it cannot be hit reliably by racing threads and hoping. This turns the
+/// window into a rendezvous: `poll` announces that it has entered it and then
+/// waits there until the worker thread has completely finished, which is the
+/// exact interleaving the defect needs. Nothing here changes what either side
+/// *does* -- only when it does it -- and it is compiled out entirely unless
+/// `cfg(test)`, and inert at runtime unless a test arms it.
+///
+/// This module and its two call sites are identical in the "before" and
+/// "after" commits of this branch; the only thing that differs between them
+/// is the production code under test.
+#[cfg(test)]
+mod repro {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Armed by the lost-wakeup reproduction; leaves every other test, and
+    /// every non-test caller, running unchanged.
+    pub static ARMED: AtomicBool = AtomicBool::new(false);
+    /// Set by `poll` once it has entered the window between its `try_recv`
+    /// and the waker being stored.
+    static POLL_IN_WINDOW: AtomicBool = AtomicBool::new(false);
+    /// Set by the worker thread once it has run to completion -- including
+    /// the send and whatever waking it does or does not perform.
+    static WORKER_FINISHED: AtomicBool = AtomicBool::new(false);
+
+    pub fn reset() {
+        ARMED.store(false, Ordering::SeqCst);
+        POLL_IN_WINDOW.store(false, Ordering::SeqCst);
+        WORKER_FINISHED.store(false, Ordering::SeqCst);
+    }
+
+    /// Called by `poll` on entering the `Empty` branch, before it takes the
+    /// waker mutex.
+    pub fn poll_entered_window() {
+        if !ARMED.load(Ordering::SeqCst) {
+            return;
+        }
+        POLL_IN_WINDOW.store(true, Ordering::SeqCst);
+        while !WORKER_FINISHED.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+
+    /// Held by the worker thread as its outermost local, so that it is
+    /// dropped last -- after the send and after any wake.
+    pub struct WorkerFinishedOnExit;
+
+    impl Drop for WorkerFinishedOnExit {
+        fn drop(&mut self) {
+            if ARMED.load(Ordering::SeqCst) {
+                WORKER_FINISHED.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Called by the reproduction's closure: holds the worker back until
+    /// `poll` is parked inside the window.
+    pub fn wait_for_poll_window() {
+        while !POLL_IN_WINDOW.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+}
+
 fn schedule_runnable(runnable: Runnable, high_pri: bool) {
     let func = if high_pri {
         ON_MAIN_THREAD.lock()
@@ -74,6 +140,9 @@ where
 
     let thread_waker = Arc::clone(&holder);
     std::thread::spawn(move || {
+        #[cfg(test)]
+        let _repro_worker = repro::WorkerFinishedOnExit;
+
         // Run the thread
         let res = f();
         // Pass the result back
@@ -100,6 +169,9 @@ where
             match self.rx.try_recv() {
                 Ok(res) => Poll::Ready(res),
                 Err(TryRecvError::Empty) => {
+                    #[cfg(test)]
+                    repro::poll_entered_window();
+
                     let mut waker = self.holder.waker.lock().unwrap();
                     waker.replace(cx.waker().clone());
                     Poll::Pending
@@ -246,5 +318,168 @@ impl ScopedExecutor {
 impl Drop for ScopedExecutor {
     fn drop(&mut self) {
         SCOPED_EXECUTOR.lock().unwrap().take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// `ScopedExecutor` publishes itself into the process-global
+    /// `SCOPED_EXECUTOR` for the duration of its lifetime, and the `repro`
+    /// scaffolding is process-global too, so these tests must not run
+    /// concurrently with each other.
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Sanity check on the ordinary path, so that a change which breaks the
+    /// channel or the wake outright shows up here rather than as a puzzling
+    /// hang somewhere else. Passes both before and after the fix; it is here
+    /// to show the harness itself is sound.
+    #[test]
+    fn happy_path_returns_the_closures_result() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        repro::reset();
+        let scoped = ScopedExecutor::new();
+        let result = block_on(scoped.run(async { spawn_into_new_thread(|| Ok(42)).await }));
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    /// Defect (2): the lost wakeup.
+    ///
+    /// `poll` does one `try_recv`, and only *afterwards* stores the waker. A
+    /// worker that sends in between takes the waker mutex, finds nothing to
+    /// wake, and exits; `poll` then stores a waker that nobody will ever use
+    /// and returns `Pending`. The result is sitting in the channel the whole
+    /// time -- one more poll would deliver it -- but no poll is ever
+    /// scheduled.
+    ///
+    /// The `repro` scaffolding forces exactly that interleaving, so the
+    /// outcome is not a matter of timing:
+    ///
+    /// * before the fix this test never returns, and has to be killed;
+    /// * after the fix it returns `7` immediately, because `poll` registers
+    ///   the waker first and then re-checks the channel.
+    #[test]
+    fn a_result_sent_inside_the_poll_window_is_not_lost() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        repro::reset();
+        repro::ARMED.store(true, Ordering::SeqCst);
+
+        let scoped = ScopedExecutor::new();
+        let result = block_on(scoped.run(async {
+            spawn_into_new_thread(|| {
+                // Hold the result back until `poll` is parked in the window.
+                repro::wait_for_poll_window();
+                Ok(7)
+            })
+            .await
+        }));
+
+        repro::reset();
+        assert_eq!(
+            result.unwrap(),
+            7,
+            "a result sent while poll was between its try_recv and storing \
+             the waker must still be delivered"
+        );
+    }
+
+    /// Defect (1): the worker thread panics when its consumer has gone away.
+    ///
+    /// `tx.send(res).unwrap()` treats a disconnected channel as impossible.
+    /// It isn't: the future that owns the receiving end is dropped whenever
+    /// the caller is cancelled, and the worker cannot know that. Nothing
+    /// reads the result at that point, so discarding it is the whole of the
+    /// correct response -- taking the thread down instead is not.
+    ///
+    /// A panic on a spawned thread does not fail the test that spawned it,
+    /// so the panic is observed through a hook rather than assumed.
+    ///
+    /// * before the fix this test fails, printing the captured panic;
+    /// * after the fix it passes.
+    #[test]
+    fn a_cancelled_consumer_does_not_panic_the_worker() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        repro::reset();
+
+        let (release_tx, release_rx) = bounded::<()>(1);
+        let (panic_tx, panic_rx) = bounded::<String>(1);
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = panic_tx.try_send(format!("{}", info));
+        }));
+
+        let scoped = ScopedExecutor::new();
+        let task = spawn_into_new_thread(move || {
+            // Stay alive until the consumer is definitely gone.
+            let _ = release_rx.recv();
+            Ok(())
+        });
+
+        // Let the executor poll the pending future once, so that this models
+        // a consumer that was already awaiting rather than one that never
+        // started.
+        block_on(scoped.run(async_io::Timer::after(Duration::from_millis(50))));
+
+        // The consumer is cancelled: dropping the task, and then the
+        // executor holding it, drops the future that owns the receiving end.
+        drop(task);
+        drop(scoped);
+
+        release_tx.send(()).unwrap();
+
+        let panicked = panic_rx.recv_timeout(Duration::from_secs(5));
+        std::panic::set_hook(previous_hook);
+
+        assert!(
+            panicked.is_err(),
+            "the worker thread panicked after its consumer was cancelled: {}",
+            panicked.unwrap_or_default()
+        );
+    }
+
+    /// Defect (3): a panic in `f` unwinds past both the send and the wake.
+    ///
+    /// `poll` already knows how to report a worker that produced no result --
+    /// it turns the disconnected channel into an error -- but it only gets
+    /// the chance if something wakes it up to look.
+    ///
+    /// Left to its own timing this repro would have a hole: a worker that
+    /// finishes unwinding before the first poll leaves a disconnected
+    /// channel, which `poll` reports as an error without needing any wake.
+    /// The same rendezvous as the lost-wakeup test closes it -- the worker
+    /// holds its panic until `poll` is parked inside the window, so the
+    /// waker is always stored *after* the unwind, on both sides of the fix:
+    ///
+    /// * before the fix nothing ever wakes that waker, so this test never
+    ///   returns and has to be killed;
+    /// * after the fix the re-check behind the waker store sees the
+    ///   disconnected channel and reports the error deterministically.
+    #[test]
+    fn a_panicking_worker_reports_an_error_instead_of_hanging() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        repro::reset();
+        repro::ARMED.store(true, Ordering::SeqCst);
+
+        let scoped = ScopedExecutor::new();
+        let result: anyhow::Result<()> = block_on(scoped.run(async {
+            spawn_into_new_thread(|| -> anyhow::Result<()> {
+                // Hold the panic back until `poll` is parked in the window,
+                // so the unwind cannot win the race against the first poll.
+                repro::wait_for_poll_window();
+                panic!("intentional test panic, exercising the unwind path")
+            })
+            .await
+        }));
+
+        repro::reset();
+        assert!(
+            result.is_err(),
+            "a thread that panics before producing a result must report an \
+             error, not hang forever"
+        );
     }
 }

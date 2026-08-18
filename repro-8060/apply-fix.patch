@@ -1,0 +1,101 @@
+--- a/promise/src/spawn.rs
++++ b/promise/src/spawn.rs
+@@ -143,17 +143,51 @@
+         #[cfg(test)]
+         let _repro_worker = repro::WorkerFinishedOnExit;
+ 
+-        // Run the thread
+-        let res = f();
+-        // Pass the result back
+-        tx.send(res).unwrap();
+-        // If someone polled the thread before we got here,
+-        // they will have populated the waker; extract it
+-        // and wake up the scheduler so that it will poll
+-        // the result again.
+-        let mut waker = thread_waker.waker.lock().unwrap();
+-        if let Some(waker) = waker.take() {
+-            waker.wake();
++        // Wake the poller from a drop guard rather than inline at the end of
++        // this closure, so that it happens on every exit from this thread --
++        // including `f()` panicking and unwinding straight past here. `poll`
++        // below already knows how to report a thread that produced no result
++        // (it turns the disconnected channel into an error), but it only gets
++        // the chance if something wakes it up to look; without this the future
++        // would stay parked for the rest of the process's life.
++        struct WakeOnExit(Arc<WakerHolder>);
++
++        impl Drop for WakeOnExit {
++            fn drop(&mut self) {
++                // Tolerate a poisoned lock rather than unwrapping: this may
++                // run while already unwinding, where panicking a second time
++                // aborts the process. `wake()` below is left unguarded --
++                // `Waker`'s contract says it doesn't panic, and the only way
++                // it could here is a poisoned scheduler mutex, which has
++                // already broken every other spawn in the process.
++                let mut waker = match self.0.waker.lock() {
++                    Ok(waker) => waker,
++                    Err(err) => err.into_inner(),
++                };
++                // If someone polled the thread before we got here,
++                // they will have populated the waker; extract it
++                // and wake up the scheduler so that it will poll
++                // the result again.
++                if let Some(waker) = waker.take() {
++                    waker.wake();
++                }
++            }
++        }
++
++        let _wake_on_exit = WakeOnExit(thread_waker);
++
++        {
++            // Rebinding moves the sender into this inner scope, so that it is
++            // dropped before the guard above wakes anyone. The order matters:
++            // a poll racing in between a wake and the sender's drop would find
++            // the channel empty but still connected, re-register its waker,
++            // and go back to sleep with nothing left to wake it.
++            let tx = tx;
++            // Run the thread
++            let res = f();
++            // Pass the result back, but don't panic if the receiving future
++            // was already dropped/cancelled (channel disconnected).
++            let _ = tx.send(res);
+         }
+     });
+ 
+@@ -166,18 +200,31 @@
+         type Output = Result<T>;
+ 
+         fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Self::Output> {
++            // Check if result is already available
+             match self.rx.try_recv() {
+                 Ok(res) => Poll::Ready(res),
++                Err(TryRecvError::Disconnected) => {
++                    Poll::Ready(Err(anyhow!("thread terminated without providing a result")))
++                }
+                 Err(TryRecvError::Empty) => {
+                     #[cfg(test)]
+                     repro::poll_entered_window();
+ 
++                    // Register the waker, then re-check: closes the race
++                    // window where the worker sends between the first
++                    // `try_recv` above and the waker being stored, which
++                    // would otherwise have nothing left to wake it.
+                     let mut waker = self.holder.waker.lock().unwrap();
+                     waker.replace(cx.waker().clone());
+-                    Poll::Pending
+-                }
+-                Err(TryRecvError::Disconnected) => {
+-                    Poll::Ready(Err(anyhow!("thread terminated without providing a result")))
++                    drop(waker);
++
++                    match self.rx.try_recv() {
++                        Ok(res) => Poll::Ready(res),
++                        Err(TryRecvError::Disconnected) => Poll::Ready(Err(anyhow!(
++                            "thread terminated without providing a result"
++                        ))),
++                        Err(TryRecvError::Empty) => Poll::Pending,
++                    }
+                 }
+             }
+         }
